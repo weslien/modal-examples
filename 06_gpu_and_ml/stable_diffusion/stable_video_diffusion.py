@@ -1,13 +1,19 @@
 # ---
 # cmd: ["modal", "serve", "06_gpu_and_ml/stable_diffusion/stable_video_diffusion.py"]
 # ---
+# # Run Stable Video Diffusion in a Streamlit app
+#
+# This example runs the [Stable Video Diffusion](https://huggingface.co/stabilityai/stable-video-diffusion-img2vid-xt) image-to-video model.
+
 import os
 import sys
 
 import modal
 
-stub = modal.Stub(name="example-stable-video-diffusion-streamlit")
-stub.q = modal.Queue.new()
+app = modal.App(name="example-stable-video-diffusion-streamlit")
+q = modal.Queue.from_name(
+    "stable-video-diffusion-streamlit", create_if_missing=True
+)
 
 session_timeout = 15 * 60
 
@@ -56,7 +62,7 @@ svd_image = (
 )
 
 
-@stub.function(image=svd_image, timeout=session_timeout, gpu="A100")
+@app.function(image=svd_image, timeout=session_timeout, gpu="A100")
 def run_streamlit(publish_url: bool = False):
     from streamlit.web.bootstrap import load_config_options, run
 
@@ -68,23 +74,30 @@ def run_streamlit(publish_url: bool = False):
     with modal.forward(8501) as tunnel:
         # Reload Streamlit config with information about Modal tunnel address.
         if publish_url:
-            stub.q.put(tunnel.url)
+            q.put(tunnel.url)
         load_config_options(
             {"browser.serverAddress": tunnel.host, "browser.serverPort": 443}
         )
         run(
             main_script_path="/sgm/scripts/demo/video_sampling.py",
-            command_line=None,
+            is_hello=False,
             args=["--timeout", str(session_timeout)],
             flag_options={},
         )
 
 
-@stub.function()
+endpoint_image = modal.Image.debian_slim(python_version="3.10").pip_install(
+    "fastapi[standard]==0.115.4",
+    "pydantic==2.9.2",
+    "starlette==0.41.2",
+)
+
+
+@app.function(image=endpoint_image)
 @modal.web_endpoint(method="GET", label="svd")
 def share():
     from fastapi.responses import RedirectResponse
 
     run_streamlit.spawn(publish_url=True)
-    url = stub.q.get()
+    url = q.get()
     return RedirectResponse(url, status_code=303)

@@ -7,7 +7,7 @@ from typing import Iterator, Optional
 
 from pydantic import BaseModel
 
-DEFAULT_DIRECTORY = Path(__file__).parent.parent
+EXAMPLES_ROOT = Path(__file__).parent.parent
 
 
 with warnings.catch_warnings():
@@ -33,6 +33,10 @@ class Example(BaseModel):
     repo_filename: str  # git repo relative filepath
     cli_args: Optional[list] = None  # Full command line args to run it
     stem: Optional[str] = None  # stem of path
+    tags: Optional[list[str]] = None  # metadata tags for the example
+    env: Optional[dict[str, str]] = (
+        None  # environment variables for the example
+    )
 
 
 _RE_NEWLINE = re.compile(r"\r?\n")
@@ -117,6 +121,8 @@ def gather_example_files(
                 )
                 cmd = metadata.get("cmd", ["modal", "run", repo_filename])
                 args = metadata.get("args", [])
+                tags = metadata.get("tags", [])
+                env = metadata.get("env", dict())
                 yield Example(
                     type=ExampleType.MODULE,
                     filename=filename_abs,
@@ -125,6 +131,8 @@ def gather_example_files(
                     repo_filename=repo_filename,
                     cli_args=(cmd + args),
                     stem=Path(filename_abs).stem,
+                    tags=tags,
+                    env=env,
                 )
             elif ext in [".png", ".jpeg", ".jpg", ".gif", ".mp4"]:
                 yield Example(
@@ -136,22 +144,21 @@ def gather_example_files(
                 ignored.append(str(filename))
 
 
-def get_examples(
-    directory: Path = DEFAULT_DIRECTORY, silent=False
-) -> Iterator[Example]:
+def get_examples() -> Iterator[Example]:
     """Yield all Python module files and asset files relevant to building modal.com/docs."""
-    if not directory.exists():
+    if not EXAMPLES_ROOT.exists():
         raise Exception(
-            f"Can't find directory {directory}. You might need to clone the modal-examples repo there"
+            f"Can't find directory {EXAMPLES_ROOT}. You might need to clone the modal-examples repo there."
         )
 
     ignored = []
     for subdir in sorted(
         p
-        for p in directory.iterdir()
+        for p in EXAMPLES_ROOT.iterdir()
         if p.is_dir()
         and not p.name.startswith(".")
         and not p.name.startswith("internal")
+        and not p.name.startswith("misc")
     ):
         yield from gather_example_files(
             parents=[], subdir=subdir, ignored=ignored, recurse=True

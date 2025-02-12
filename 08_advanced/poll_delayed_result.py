@@ -1,17 +1,25 @@
 # ---
 # lambda-test: false
 # ---
+
+# # Polling for a delayed result on Modal
+
+# This example shows how you can poll for a delayed result on Modal.
+
+# The function `factor_number` takes a number as input and returns the prime factors of the number. The function could take a long time to run, so we don't want to wait for the result in the web server.
+# Instead, we return a URL that the client can poll to get the result.
+
 import fastapi
-from modal import Image, Stub, asgi_app
+import modal
 from modal.functions import FunctionCall
 from starlette.responses import HTMLResponse, RedirectResponse
 
-stub = Stub("example-poll")
+app = modal.App("example-poll")
 
 web_app = fastapi.FastAPI()
 
 
-@stub.function(image=Image.debian_slim().pip_install("primefac"))
+@app.function(image=modal.Image.debian_slim().pip_install("primefac"))
 def factor_number(number):
     import primefac
 
@@ -52,7 +60,7 @@ async def web_poll(function_id: str):
     return result
 
 
-@stub.function()
-@asgi_app()
+@app.function()
+@modal.asgi_app()
 def fastapi_app():
     return web_app

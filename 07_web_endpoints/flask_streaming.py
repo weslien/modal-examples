@@ -2,16 +2,19 @@
 # lambda-test: false
 # ---
 
-import modal
-from modal import wsgi_app
+# # Deploy Flask app with streaming results with Modal
 
-stub = modal.Stub(
+# This example shows how you can deploy a [Flask](https://flask.palletsprojects.com/en/3.0.x/) app with Modal that streams results back to the client.
+
+import modal
+
+app = modal.App(
     "example-web-flask-stream",
     image=modal.Image.debian_slim().pip_install("flask"),
 )
 
 
-@stub.function()
+@app.function()
 def generate_rows():
     """
     This creates a large CSV file, about 10MB, which will be streaming downloaded
@@ -22,8 +25,8 @@ def generate_rows():
         yield f"{line}\n"
 
 
-@stub.function()
-@wsgi_app()
+@app.function()
+@modal.wsgi_app()
 def flask_app():
     from flask import Flask
 

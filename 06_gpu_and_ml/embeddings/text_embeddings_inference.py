@@ -1,15 +1,20 @@
 # ---
 # cmd: ["modal", "run", "06_gpu_and_ml/embeddings/text_embeddings_inference.py::embed_dataset"]
 # ---
+
+# # Run TextEmbeddingsInference (TEI) on Modal
+
+# This example runs the [Text Embedding Inference (TEI)](https://github.com/huggingface/text-embeddings-inference) toolkit on the Hacker News BigQuery public dataset.
+
 import json
 import os
 import socket
 import subprocess
 from pathlib import Path
 
-from modal import Image, Secret, Stub, Volume, enter, exit, gpu, method
+import modal
 
-GPU_CONFIG = gpu.A10G()
+GPU_CONFIG = "A10G"
 MODEL_ID = "BAAI/bge-base-en-v1.5"
 BATCH_SIZE = 32
 DOCKER_IMAGE = (
@@ -29,13 +34,7 @@ LAUNCH_FLAGS = [
 
 
 def spawn_server() -> subprocess.Popen:
-    process = subprocess.Popen(
-        ["text-embeddings-router"] + LAUNCH_FLAGS,
-        env={
-            **os.environ,
-            "HUGGING_FACE_HUB_TOKEN": os.environ["HF_TOKEN"],
-        },
-    )
+    process = subprocess.Popen(["text-embeddings-router"] + LAUNCH_FLAGS)
 
     # Poll until webserver at 127.0.0.1:8000 accepts connections before running inputs.
     while True:
@@ -58,33 +57,27 @@ def download_model():
     spawn_server().terminate()
 
 
-volume = Volume.persisted("tei-hn-data")
+volume = modal.Volume.from_name("tei-hn-data", create_if_missing=True)
 
-stub = Stub("example-tei")
+app = modal.App("example-tei")
 
 
 tei_image = (
-    Image.from_registry(
-        "ghcr.io/huggingface/text-embeddings-inference:86-0.4.0",
+    modal.Image.from_registry(
+        DOCKER_IMAGE,
         add_python="3.10",
     )
     .dockerfile_commands("ENTRYPOINT []")
-    .run_function(
-        download_model,
-        gpu=GPU_CONFIG,
-        secrets=[Secret.from_name("huggingface-secret")],
-    )
+    .run_function(download_model, gpu=GPU_CONFIG)
     .pip_install("httpx")
 )
 
 
 with tei_image.imports():
-    import numpy as np
     from httpx import AsyncClient
 
 
-@stub.cls(
-    secrets=[Secret.from_name("huggingface-secret")],
+@app.cls(
     gpu=GPU_CONFIG,
     image=tei_image,
     # Use up to 20 GPU containers at once.
@@ -93,25 +86,23 @@ with tei_image.imports():
     allow_concurrent_inputs=10,
 )
 class TextEmbeddingsInference:
-    @enter()
+    @modal.enter()
     def setup_server(self):
         self.process = spawn_server()
         self.client = AsyncClient(base_url="http://127.0.0.1:8000")
 
-    @exit()
+    @modal.exit()
     def teardown_server(self):
         self.process.terminate()
 
-    @method()
+    @modal.method()
     async def embed(self, inputs_with_ids: list[tuple[int, str]]):
         ids, inputs = zip(*inputs_with_ids)
         resp = await self.client.post("/embed", json={"inputs": inputs})
         resp.raise_for_status()
         outputs = resp.json()
 
-        # Returning a list is slower because of additional Modal-specific overhead,
-        # to be fixed shortly.
-        return np.array(zip(ids, outputs))
+        return list(zip(ids, outputs))
 
 
 def download_data():
@@ -126,9 +117,9 @@ def download_data():
         "bigquery-public-data.hacker_news.full",
         max_results=100_000,
     )
-    df = iterator.to_dataframe(progress_bar_type="tqdm")
+    df = iterator.to_dataframe(progress_bar_type="tqdm").dropna()
+
     df["id"] = df["id"].astype(int)
-    # TODO: better chunking / splitting.
     df["text"] = df["text"].apply(lambda x: x[:512])
 
     data = list(zip(df["id"], df["text"]))
@@ -139,7 +130,7 @@ def download_data():
     volume.commit()
 
 
-image = Image.debian_slim().pip_install(
+image = modal.Image.debian_slim(python_version="3.10").pip_install(
     "google-cloud-bigquery", "pandas", "db-dtypes", "tqdm"
 )
 
@@ -148,9 +139,9 @@ with image.imports():
     from google.oauth2 import service_account
 
 
-@stub.function(
+@app.function(
     image=image,
-    secrets=[Secret.from_name("bigquery")],
+    secrets=[modal.Secret.from_name("bigquery")],
     volumes={DATA_PATH.parent: volume},
 )
 def embed_dataset():

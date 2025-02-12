@@ -21,7 +21,7 @@ import pathlib
 
 import modal
 
-stub = modal.Stub("example-screenshot")
+app = modal.App("example-screenshot")
 
 # ## Define a custom image
 #
@@ -35,7 +35,7 @@ image = modal.Image.debian_slim().run_commands(
     "apt-get install -y software-properties-common",
     "apt-add-repository non-free",
     "apt-add-repository contrib",
-    "pip install playwright==1.30.0",
+    "pip install playwright==1.42.0",
     "playwright install-deps chromium",
     "playwright install chromium",
 )
@@ -46,7 +46,7 @@ image = modal.Image.debian_slim().run_commands(
 # This is a Modal function which runs inside the remote container.
 
 
-@stub.function(image=image)
+@app.function(image=image)
 async def screenshot(url):
     from playwright.async_api import async_playwright
 
@@ -66,7 +66,7 @@ async def screenshot(url):
 # Let's kick it off by reading a bunch of URLs from a txt file and scrape some of those.
 
 
-@stub.local_entrypoint()
+@app.local_entrypoint()
 def main(url: str = "https://modal.com"):
     filename = pathlib.Path("/tmp/screenshots/screenshot.png")
     data = screenshot.remote(url)

@@ -1,18 +1,24 @@
+# # Parallel execution on Modal with `spawn`
+
+# This example shows how you can run multiple functions in parallel on Modal.
+# We use the `spawn` method to start a function and return a handle to its result.
+# The `get` method is used to retrieve the result of the function call.
+
 import time
 
 import modal
 
-stub = modal.Stub("example-parallel")
+app = modal.App("example-parallel")
 
 
-@stub.function()
+@app.function()
 def step1(word):
     time.sleep(2)
     print("step1 done")
     return word
 
 
-@stub.function()
+@app.function()
 def step2(number):
     time.sleep(1)
     print("step2 done")
@@ -21,7 +27,7 @@ def step2(number):
     return number
 
 
-@stub.local_entrypoint()
+@app.local_entrypoint()
 def main():
     # Start running a function and return a handle to its result.
     word_call = step1.spawn("foo")

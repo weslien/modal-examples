@@ -9,24 +9,17 @@ import json
 import pathlib
 from typing import Iterator, Tuple
 
-from modal import (
-    Dict,
-    Image,
-    Mount,
-    NetworkFileSystem,
-    Period,
-    Secret,
-    Stub,
-    asgi_app,
-)
+import modal
 
 from . import config, podcast, search
 
 logger = config.get_logger(__name__)
-volume = NetworkFileSystem.persisted("dataset-cache-vol")
+volume = modal.NetworkFileSystem.from_name(
+    "dataset-cache-vol", create_if_missing=True
+)
 
 app_image = (
-    Image.debian_slim(python_version="3.10")
+    modal.Image.debian_slim(python_version="3.10")
     .apt_install("git")
     .pip_install(
         "git+https://github.com/openai/whisper.git",
@@ -37,24 +30,28 @@ app_image = (
         "pandas",
         "loguru==0.6.0",
         "torchaudio==2.1.0",
+        "fastapi[standard]==0.115.4",
+        "numpy<2",
     )
     .apt_install("ffmpeg")
     .pip_install("ffmpeg-python")
 )
-search_image = Image.debian_slim(python_version="3.10").pip_install(
+search_image = modal.Image.debian_slim(python_version="3.10").pip_install(
     "scikit-learn~=1.3.0",
     "tqdm~=4.46.0",
     "numpy~=1.23.3",
     "dacite",
 )
 
-stub = Stub(
+app = modal.App(
     "whisper-pod-transcriber",
     image=app_image,
-    secrets=[Secret.from_name("podchaser")],
+    secrets=[modal.Secret.from_name("podchaser")],
 )
 
-stub.in_progress = Dict.new()
+in_progress = modal.Dict.from_name(
+    "pod-transcriber-in-progress", create_if_missing=True
+)
 
 
 def utc_now() -> datetime.datetime:
@@ -69,7 +66,7 @@ def get_transcript_path(guid_hash: str) -> pathlib.Path:
     return config.TRANSCRIPTIONS_DIR / f"{guid_hash}.json"
 
 
-@stub.function(network_file_systems={config.CACHE_DIR: volume})
+@app.function(network_file_systems={config.CACHE_DIR: volume})
 def populate_podcast_metadata(podcast_id: str):
     from gql import gql
 
@@ -96,12 +93,12 @@ def populate_podcast_metadata(podcast_id: str):
     logger.info(f"Populated metadata for {pod_metadata.title}")
 
 
-@stub.function(
-    mounts=[Mount.from_local_dir(config.ASSETS_PATH, remote_path="/assets")],
+@app.function(
+    image=app_image.add_local_dir(config.ASSETS_PATH, remote_path="/assets"),
     network_file_systems={config.CACHE_DIR: volume},
     keep_warm=2,
 )
-@asgi_app()
+@modal.asgi_app()
 def fastapi_app():
     import fastapi.staticfiles
 
@@ -114,9 +111,7 @@ def fastapi_app():
     return web_app
 
 
-@stub.function(
-    image=app_image,
-)
+@app.function()
 def search_podcast(name):
     from gql import gql
 
@@ -139,9 +134,8 @@ def search_podcast(name):
     ]
 
 
-@stub.function(
+@app.function(
     image=search_image,
-    schedule=Period(hours=4),
     network_file_systems={config.CACHE_DIR: volume},
     timeout=(400 * 60),
 )
@@ -283,10 +277,11 @@ def split_silences(
     logger.info(f"Split {path} into {num_segments} segments")
 
 
-@stub.function(
+@app.function(
     image=app_image,
     network_file_systems={config.CACHE_DIR: volume},
     cpu=2,
+    timeout=400,
 )
 def transcribe_segment(
     start: float,
@@ -330,7 +325,7 @@ def transcribe_segment(
     return result
 
 
-@stub.function(
+@app.function(
     image=app_image,
     network_file_systems={config.CACHE_DIR: volume},
     timeout=900,
@@ -361,7 +356,7 @@ def transcribe_episode(
         json.dump(result, f, indent=4)
 
 
-@stub.function(
+@app.function(
     image=app_image,
     network_file_systems={config.CACHE_DIR: volume},
     timeout=900,
@@ -410,12 +405,12 @@ def process_episode(podcast_id: str, episode_id: str):
                 model=model,
             )
     finally:
-        del stub.in_progress[episode_id]
+        del in_progress[episode_id]
 
     return episode
 
 
-@stub.function(
+@app.function(
     image=app_image,
     network_file_systems={config.CACHE_DIR: volume},
 )
@@ -450,7 +445,7 @@ def fetch_episodes(show_name: str, podcast_id: str, max_episodes=100):
     return episodes
 
 
-@stub.local_entrypoint()
+@app.local_entrypoint()
 def search_entrypoint(name: str):
     # To search for a podcast, run:
     # modal run app.main --name "search string"

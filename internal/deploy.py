@@ -1,4 +1,5 @@
 import argparse
+import os
 import re
 import shlex
 import subprocess
@@ -17,32 +18,32 @@ class DeployError(NamedTuple):
 
 def deploy(
     deployable: bool,
-    module_with_stub: Path,
+    module_with_app: Path,
     dry_run: bool,
     filter_pttrn: Optional[str],
+    env: Optional[dict[str, str]],
 ) -> Optional[DeployError]:
-    if filter_pttrn and not re.match(filter_pttrn, module_with_stub.name):
+    if filter_pttrn and not re.match(filter_pttrn, module_with_app.name):
         return None
 
     if not deployable:
-        print(
-            f"⏩ skipping: '{module_with_stub.name}' is not marked for deploy"
-        )
+        print(f"⏩ skipping: '{module_with_app.name}' is not marked for deploy")
         return None
 
-    deploy_command = f"modal deploy {module_with_stub.name}"
+    deploy_command = f"modal deploy {module_with_app.name}"
     if dry_run:
-        print(f"🌵  dry-run: '{module_with_stub.name}' would have deployed")
+        print(f"🌵  dry-run: '{module_with_app.name}' would have deployed")
     else:
-        print(f"⛴ deploying: '{module_with_stub.name}' ...")
+        print(f"⛴ deploying: '{module_with_app.name}' ...")
         r = subprocess.run(
             shlex.split(deploy_command),
-            cwd=module_with_stub.parent,
+            cwd=module_with_app.parent,
             capture_output=True,
+            env=os.environ | (env or {}),
         )
         if r.returncode != 0:
             print(
-                f"⚠️ deployment failed: '{module_with_stub.name}'",
+                f"⚠️ deployment failed: '{module_with_app.name}'",
                 file=sys.stderr,
             )
             print(r.stderr)
@@ -50,7 +51,7 @@ def deploy(
                 stdout=r.stdout, stderr=r.stderr, code=r.returncode
             )
         else:
-            print(f"✔️ deployed '{module_with_stub.name}")
+            print(f"✔️ deployed '{module_with_app.name}")
     return None
 
 
@@ -87,9 +88,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     results = [
         deploy(
             deployable=bool(ex_mod.metadata.get("deploy")),
-            module_with_stub=Path(ex_mod.filename),
+            module_with_app=Path(ex_mod.module),
             dry_run=arguments.dry_run,
             filter_pttrn=filter_pttrn,
+            env=ex_mod.metadata.get("env"),
         )
         for ex_mod in example_modules
     ]

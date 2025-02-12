@@ -4,9 +4,10 @@
 # ---
 # # Fetching stock prices in parallel
 #
-# This is a simple example that uses the Yahoo! Finance API to fetch a bunch of ETFs
-# We do this in parallel, which demonstrates the ability to map over a set of items
-# In this case, we fetch 100 stocks in parallel
+# This is a simple example that uses the Yahoo! Finance API to fetch a bunch of stock data.
+#
+# We do this in parallel, which demonstrates the ability to map over a set of items,
+# in this case 100 stock tickers.
 #
 # You can run this script on the terminal with
 #
@@ -32,7 +33,7 @@ import os
 
 import modal
 
-stub = modal.Stub(
+app = modal.App(
     "example-fetch-stock-prices",
     image=modal.Image.debian_slim().pip_install(
         "httpx~=0.24.0",
@@ -49,7 +50,7 @@ stub = modal.Stub(
 # and ask for the top 100 ETFs.
 
 
-@stub.function()
+@app.function()
 def get_stocks():
     import bs4
     import httpx
@@ -59,14 +60,17 @@ def get_stocks():
         "referer": "https://finance.yahoo.com/",
     }
     url = "https://finance.yahoo.com/etfs?count=100&offset=0"
-    res = httpx.get(url, headers=headers)
+    res = httpx.get(url, headers=headers, follow_redirects=True)
     res.raise_for_status()
     soup = bs4.BeautifulSoup(res.text, "html.parser")
-    for td in soup.find_all("td", {"aria-label": "Symbol"}):
-        for link in td.find_all("a", {"data-test": "quoteLink"}):
-            symbol = str(link.next)
-            print(f"Found symbol {symbol}")
-            yield symbol
+    for link in soup.select('a[href*="/quote/"]'):
+        try:
+            symbol, *_ = link.text.strip().split(" ")
+            if symbol:
+                print(f"Found symbol {symbol}")
+                yield symbol
+        except Exception as e:
+            print(f"Error parsing {link}: {e}")
 
 
 # ## Fetch stock prices
@@ -75,7 +79,7 @@ def get_stocks():
 # It's fairly simple and just uses the `yfinance` package.
 
 
-@stub.function()
+@app.function()
 def get_prices(symbol):
     import yfinance
 
@@ -94,7 +98,7 @@ def get_prices(symbol):
 # and return the binary content from the function.
 
 
-@stub.function()
+@app.function()
 def plot_stocks():
     from matplotlib import pyplot, ticker
 
@@ -135,7 +139,7 @@ def plot_stocks():
 
     # Configure axes and title
     ax.yaxis.set_major_formatter(ticker.PercentFormatter())
-    ax.set_title(f"Best ETFs {first_date.date()} - {last_date.date()}")
+    ax.set_title(f"Best Tickers {first_date.date()} - {last_date.date()}")
     ax.set_ylabel(f"% change, {first_date.date()} = 0%")
 
     # Dump the chart to .png and return the bytes
@@ -152,7 +156,7 @@ def plot_stocks():
 OUTPUT_DIR = "/tmp/"
 
 
-@stub.local_entrypoint()
+@app.local_entrypoint()
 def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     data = plot_stocks.remote()

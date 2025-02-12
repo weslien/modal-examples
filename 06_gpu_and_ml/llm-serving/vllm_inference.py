@@ -1,199 +1,254 @@
-# # Fast inference with vLLM (Mistral 7B)
-#
-# In this example, we show how to run basic inference, using [`vLLM`](https://github.com/vllm-project/vllm)
-# to take advantage of PagedAttention, which speeds up sequential inferences with optimized key-value caching.
-#
-# `vLLM` also supports a use case as a FastAPI server which we will explore in a future guide. This example
-# walks through setting up an environment that works with `vLLM ` for basic inference.
-#
-# We are running the [Mistral 7B Instruct](https://huggingface.co/mistralai/Mistral-7B-Instruct-v0.1) model here, which is an instruct fine-tuned version of Mistral's 7B model best fit for conversation.
-# You can expect 20 second cold starts and well over 100 tokens/second. The larger the batch of prompts, the higher the throughput.
-# For example, with the 60 prompts below, we can produce 19k tokens in 15 seconds, which is around 1.25k tokens/second.
-#
-# To run
-# [any of the other supported models](https://vllm.readthedocs.io/en/latest/models/supported_models.html),
-# simply replace the model name in the download step. You may also need to enable `trust_remote_code` for MPT models (see comment below)..
-#
-# ## Setup
-#
-# First we import the components we need from `modal`.
+# ---
+# cmd: ["modal", "serve", "06_gpu_and_ml/llm-serving/vllm_inference.py"]
+# pytest: false
+# ---
 
-import os
+# # Run OpenAI-compatible LLM inference with LLaMA 3.1-8B and vLLM
 
-from modal import Image, Secret, Stub, enter, method
+# LLMs do more than just model language: they chat, they produce JSON and XML, they run code, and more.
+# This has complicated their interface far beyond "text-in, text-out".
+# OpenAI's API has emerged as a standard for that interface,
+# and it is supported by open source LLM serving frameworks like [vLLM](https://docs.vllm.ai/en/latest/).
 
-MODEL_DIR = "/model"
-BASE_MODEL = "mistralai/Mistral-7B-Instruct-v0.1"
+# In this example, we show how to run a vLLM server in OpenAI-compatible mode on Modal.
+# You can find a video walkthrough of this example on our YouTube channel [here](https://www.youtube.com/watch?v=QmY_7ePR1hM).
 
+# Note that the vLLM server is a FastAPI app, which can be configured and extended just like any other.
+# Here, we use it to add simple authentication middleware, following the
+# [implementation in the vLLM repository](https://github.com/vllm-project/vllm/blob/v0.5.3post1/vllm/entrypoints/openai/api_server.py).
 
-# ## Define a container image
-#
-# We want to create a Modal image which has the model weights pre-saved to a directory. The benefit of this
-# is that the container no longer has to re-download the model from Huggingface - instead, it will take
-# advantage of Modal's internal filesystem for faster cold starts.
-#
-# ### Download the weights
-# Make sure you have created a [HuggingFace access token](https://huggingface.co/settings/tokens).
-# To access the token in a Modal function, we can create a secret on the [secrets page](https://modal.com/secrets).
-# Now the token will be available via the environment variable named `HF_TOKEN`. Functions that inject this secret will have access to the environment variable.
-#
-# We can download the model to a particular directory using the HuggingFace utility function `snapshot_download`.
-#
-# Tip: avoid using global variables in this function. Changes to code outside this function will not be detected and the download step will not re-run.
-def download_model_to_folder():
-    from huggingface_hub import snapshot_download
-    from transformers.utils import move_cache
+# Our examples repository also includes scripts for running clients and load-testing for OpenAI-compatible APIs
+# [here](https://github.com/modal-labs/modal-examples/tree/main/06_gpu_and_ml/llm-serving/openai_compatible).
 
-    os.makedirs(MODEL_DIR, exist_ok=True)
+# You can find a video walkthrough of this example and the related scripts on the Modal YouTube channel
+# [here](https://www.youtube.com/watch?v=QmY_7ePR1hM).
 
-    snapshot_download(
-        BASE_MODEL,
-        local_dir=MODEL_DIR,
-        token=os.environ["HF_TOKEN"],
-    )
-    move_cache()
+# ## Set up the container image
 
+# Our first order of business is to define the environment our server will run in:
+# the [container `Image`](https://modal.com/docs/guide/custom-container).
+# vLLM can be installed with `pip`.
 
-# ### Image definition
-# We’ll start from a recommended Dockerhub image and install `vLLM`.
-# Then we’ll use run_function to run the function defined above to ensure the weights of
-# the model are saved within the container image.
-image = (
-    Image.from_registry(
-        "nvidia/cuda:12.1.0-base-ubuntu22.04", add_python="3.10"
-    )
-    .pip_install(
-        "vllm==0.2.5",
-        "huggingface_hub==0.19.4",
-        "hf-transfer==0.1.4",
-        "torch==2.1.2",
-    )
-    # Use the barebones hf-transfer package for maximum download speeds. No progress bar, but expect 700MB/s.
-    .env({"HF_HUB_ENABLE_HF_TRANSFER": "1"})
-    .run_function(
-        download_model_to_folder,
-        secrets=[Secret.from_name("huggingface-secret")],
-        timeout=60 * 20,
-    )
+import modal
+
+vllm_image = modal.Image.debian_slim(python_version="3.12").pip_install(
+    "vllm==0.6.3post1", "fastapi[standard]==0.115.4"
 )
 
-stub = Stub("example-vllm-inference", image=image)
+# ## Download the model weights
+
+# We'll be running a pretrained foundation model -- Meta's LLaMA 3.1 8B
+# in the Instruct variant that's trained to chat and follow instructions,
+# quantized to 4-bit by [Neural Magic](https://neuralmagic.com/) and uploaded to Hugging Face.
+
+# You can read more about the `w4a16` "Machete" weight layout and kernels
+# [here](https://neuralmagic.com/blog/introducing-machete-a-mixed-input-gemm-kernel-optimized-for-nvidia-hopper-gpus/).
+
+MODELS_DIR = "/llamas"
+MODEL_NAME = "neuralmagic/Meta-Llama-3.1-8B-Instruct-quantized.w4a16"
+MODEL_REVISION = "a7c09948d9a632c2c840722f519672cd94af885d"
+
+# We need to make the weights of that model available to our Modal Functions.
+
+# So to follow along with this example, you'll need to download those weights
+# onto a Modal Volume by running another script from the
+# [examples repository](https://github.com/modal-labs/modal-examples).
+
+try:
+    volume = modal.Volume.from_name("llamas", create_if_missing=False).hydrate()
+except modal.exception.NotFoundError:
+    raise Exception("Download models first with modal run download_llama.py")
 
 
-# ## The model class
-#
-# The inference function is best represented with Modal's [class syntax](/docs/guide/lifecycle-functions) and the `@enter` decorator.
-# This enables us to load the model into memory just once every time a container starts up, and keep it cached
-# on the GPU for each subsequent invocation of the function.
-#
-# The `vLLM` library allows the code to remain quite clean.
-@stub.cls(gpu="A100", secrets=[Secret.from_name("huggingface-secret")])
-class Model:
-    @enter()
-    def load_model(self):
-        from vllm import LLM
+# ## Build a vLLM engine and serve it
 
-        # Load the model. Tip: MPT models may require `trust_remote_code=true`.
-        self.llm = LLM(MODEL_DIR)
-        self.template = """<s>[INST] <<SYS>>
-{system}
-<</SYS>>
+# vLLM's OpenAI-compatible server is exposed as a [FastAPI](https://fastapi.tiangolo.com/) router.
 
-{user} [/INST] """
+# FastAPI is a Python web framework that implements the [ASGI standard](https://en.wikipedia.org/wiki/Asynchronous_Server_Gateway_Interface),
+# much like [Flask](https://en.wikipedia.org/wiki/Flask_(web_framework)) is a Python web framework
+# that implements the [WSGI standard](https://en.wikipedia.org/wiki/Web_Server_Gateway_Interface).
 
-    @method()
-    def generate(self, user_questions):
-        from vllm import SamplingParams
+# Modal offers [first-class support for ASGI (and WSGI) apps](https://modal.com/docs/guide/webhooks). We just need to decorate a function that returns the app
+# with `@modal.asgi_app()` (or `@modal.wsgi_app()`) and then add it to the Modal app with the `app.function` decorator.
 
-        prompts = [
-            self.template.format(system="", user=q) for q in user_questions
-        ]
+# The function below first imports the FastAPI router from the vLLM library, then adds authentication compatible with OpenAI client libraries. You might also add more routes here.
 
-        sampling_params = SamplingParams(
-            temperature=0.75,
-            top_p=1,
-            max_tokens=800,
-            presence_penalty=1.15,
-        )
-        result = self.llm.generate(prompts, sampling_params)
-        num_tokens = 0
-        for output in result:
-            num_tokens += len(output.outputs[0].token_ids)
-            print(output.prompt, output.outputs[0].text, "\n\n", sep="")
-        print(f"Generated {num_tokens} tokens")
+# Then, the function creates an `AsyncLLMEngine`, the core of the vLLM server. It's responsible for loading the model, running inference, and serving responses.
+
+# After attaching that engine to the FastAPI app via the `api_server` module of the vLLM library, we return the FastAPI app
+# so it can be served on Modal.
+
+app = modal.App("example-vllm-openai-compatible")
+
+N_GPU = 1  # tip: for best results, first upgrade to more powerful GPUs, and only then increase GPU count
+TOKEN = "super-secret-token"  # auth token. for production use, replace with a modal.Secret
+
+MINUTES = 60  # seconds
+HOURS = 60 * MINUTES
 
 
-# ## Run the model
-# We define a [`local_entrypoint`](/docs/guide/apps#entrypoints-for-ephemeral-apps) to call our remote function
-# sequentially for a list of inputs. You can run this locally with `modal run vllm_inference.py`.
-@stub.local_entrypoint()
-def main():
-    model = Model()
-    questions = [
-        # Coding questions
-        "Implement a Python function to compute the Fibonacci numbers.",
-        "Write a Rust function that performs binary exponentiation.",
-        "How do I allocate memory in C?",
-        "What are the differences between Javascript and Python?",
-        "How do I find invalid indices in Postgres?",
-        "How can you implement a LRU (Least Recently Used) cache in Python?",
-        "What approach would you use to detect and prevent race conditions in a multithreaded application?",
-        "Can you explain how a decision tree algorithm works in machine learning?",
-        "How would you design a simple key-value store database from scratch?",
-        "How do you handle deadlock situations in concurrent programming?",
-        "What is the logic behind the A* search algorithm, and where is it used?",
-        "How can you design an efficient autocomplete system?",
-        "What approach would you take to design a secure session management system in a web application?",
-        "How would you handle collision in a hash table?",
-        "How can you implement a load balancer for a distributed system?",
-        # Literature
-        "What is the fable involving a fox and grapes?",
-        "Write a story in the style of James Joyce about a trip to the Australian outback in 2083, to see robots in the beautiful desert.",
-        "Who does Harry turn into a balloon?",
-        "Write a tale about a time-traveling historian who's determined to witness the most significant events in human history.",
-        "Describe a day in the life of a secret agent who's also a full-time parent.",
-        "Create a story about a detective who can communicate with animals.",
-        "What is the most unusual thing about living in a city floating in the clouds?",
-        "In a world where dreams are shared, what happens when a nightmare invades a peaceful dream?",
-        "Describe the adventure of a lifetime for a group of friends who found a map leading to a parallel universe.",
-        "Tell a story about a musician who discovers that their music has magical powers.",
-        "In a world where people age backwards, describe the life of a 5-year-old man.",
-        "Create a tale about a painter whose artwork comes to life every night.",
-        "What happens when a poet's verses start to predict future events?",
-        "Imagine a world where books can talk. How does a librarian handle them?",
-        "Tell a story about an astronaut who discovered a planet populated by plants.",
-        "Describe the journey of a letter traveling through the most sophisticated postal service ever.",
-        "Write a tale about a chef whose food can evoke memories from the eater's past.",
-        # History
-        "What were the major contributing factors to the fall of the Roman Empire?",
-        "How did the invention of the printing press revolutionize European society?",
-        "What are the effects of quantitative easing?",
-        "How did the Greek philosophers influence economic thought in the ancient world?",
-        "What were the economic and philosophical factors that led to the fall of the Soviet Union?",
-        "How did decolonization in the 20th century change the geopolitical map?",
-        "What was the influence of the Khmer Empire on Southeast Asia's history and culture?",
-        # Thoughtfulness
-        "Describe the city of the future, considering advances in technology, environmental changes, and societal shifts.",
-        "In a dystopian future where water is the most valuable commodity, how would society function?",
-        "If a scientist discovers immortality, how could this impact society, economy, and the environment?",
-        "What could be the potential implications of contact with an advanced alien civilization?",
-        # Math
-        "What is the product of 9 and 8?",
-        "If a train travels 120 kilometers in 2 hours, what is its average speed?",
-        "Think through this step by step. If the sequence a_n is defined by a_1 = 3, a_2 = 5, and a_n = a_(n-1) + a_(n-2) for n > 2, find a_6.",
-        "Think through this step by step. Calculate the sum of an arithmetic series with first term 3, last term 35, and total terms 11.",
-        "Think through this step by step. What is the area of a triangle with vertices at the points (1,2), (3,-4), and (-2,5)?",
-        "Think through this step by step. Solve the following system of linear equations: 3x + 2y = 14, 5x - y = 15.",
-        # Facts
-        "Who was Emperor Norton I, and what was his significance in San Francisco's history?",
-        "What is the Voynich manuscript, and why has it perplexed scholars for centuries?",
-        "What was Project A119 and what were its objectives?",
-        "What is the 'Dyatlov Pass incident' and why does it remain a mystery?",
-        "What is the 'Emu War' that took place in Australia in the 1930s?",
-        "What is the 'Phantom Time Hypothesis' proposed by Heribert Illig?",
-        "Who was the 'Green Children of Woolpit' as per 12th-century English legend?",
-        "What are 'zombie stars' in the context of astronomy?",
-        "Who were the 'Dog-Headed Saint' and the 'Lion-Faced Saint' in medieval Christian traditions?",
-        "What is the story of the 'Globsters', unidentified organic masses washed up on the shores?",
+@app.function(
+    image=vllm_image,
+    gpu=f"H100:{N_GPU}",
+    container_idle_timeout=5 * MINUTES,
+    timeout=24 * HOURS,
+    allow_concurrent_inputs=1000,
+    volumes={MODELS_DIR: volume},
+)
+@modal.asgi_app()
+def serve():
+    import fastapi
+    import vllm.entrypoints.openai.api_server as api_server
+    from vllm.engine.arg_utils import AsyncEngineArgs
+    from vllm.engine.async_llm_engine import AsyncLLMEngine
+    from vllm.entrypoints.logger import RequestLogger
+    from vllm.entrypoints.openai.serving_chat import OpenAIServingChat
+    from vllm.entrypoints.openai.serving_completion import (
+        OpenAIServingCompletion,
+    )
+    from vllm.entrypoints.openai.serving_engine import BaseModelPath
+    from vllm.usage.usage_lib import UsageContext
+
+    volume.reload()  # ensure we have the latest version of the weights
+
+    # create a fastAPI app that uses vLLM's OpenAI-compatible router
+    web_app = fastapi.FastAPI(
+        title=f"OpenAI-compatible {MODEL_NAME} server",
+        description="Run an OpenAI-compatible LLM server with vLLM on modal.com 🚀",
+        version="0.0.1",
+        docs_url="/docs",
+    )
+
+    # security: CORS middleware for external requests
+    http_bearer = fastapi.security.HTTPBearer(
+        scheme_name="Bearer Token",
+        description="See code for authentication details.",
+    )
+    web_app.add_middleware(
+        fastapi.middleware.cors.CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    # security: inject dependency on authed routes
+    async def is_authenticated(api_key: str = fastapi.Security(http_bearer)):
+        if api_key.credentials != TOKEN:
+            raise fastapi.HTTPException(
+                status_code=fastapi.status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid authentication credentials",
+            )
+        return {"username": "authenticated_user"}
+
+    router = fastapi.APIRouter(dependencies=[fastapi.Depends(is_authenticated)])
+
+    # wrap vllm's router in auth router
+    router.include_router(api_server.router)
+    # add authed vllm to our fastAPI app
+    web_app.include_router(router)
+
+    engine_args = AsyncEngineArgs(
+        model=MODELS_DIR + "/" + MODEL_NAME,
+        tensor_parallel_size=N_GPU,
+        gpu_memory_utilization=0.90,
+        max_model_len=8096,
+        enforce_eager=False,  # capture the graph for faster inference, but slower cold starts (30s > 20s)
+    )
+
+    engine = AsyncLLMEngine.from_engine_args(
+        engine_args, usage_context=UsageContext.OPENAI_API_SERVER
+    )
+
+    model_config = get_model_config(engine)
+
+    request_logger = RequestLogger(max_log_len=2048)
+
+    base_model_paths = [
+        BaseModelPath(name=MODEL_NAME.split("/")[1], model_path=MODEL_NAME)
     ]
-    model.generate.remote(questions)
+
+    api_server.chat = lambda s: OpenAIServingChat(
+        engine,
+        model_config=model_config,
+        base_model_paths=base_model_paths,
+        chat_template=None,
+        response_role="assistant",
+        lora_modules=[],
+        prompt_adapters=[],
+        request_logger=request_logger,
+    )
+    api_server.completion = lambda s: OpenAIServingCompletion(
+        engine,
+        model_config=model_config,
+        base_model_paths=base_model_paths,
+        lora_modules=[],
+        prompt_adapters=[],
+        request_logger=request_logger,
+    )
+
+    return web_app
+
+
+# ## Deploy the server
+
+# To deploy the API on Modal, just run
+# ```bash
+# modal deploy vllm_inference.py
+# ```
+
+# This will create a new app on Modal, build the container image for it, and deploy.
+
+# ## Interact with the server
+
+# Once it is deployed, you'll see a URL appear in the command line,
+# something like `https://your-workspace-name--example-vllm-openai-compatible-serve.modal.run`.
+
+# You can find [interactive Swagger UI docs](https://swagger.io/tools/swagger-ui/)
+# at the `/docs` route of that URL, i.e. `https://your-workspace-name--example-vllm-openai-compatible-serve.modal.run/docs`.
+# These docs describe each route and indicate the expected input and output
+# and translate requests into `curl` commands. They also demonstrate authentication.
+
+# For simple routes like `/health`, which checks whether the server is responding,
+# you can even send a request directly from the docs.
+
+# To interact with the API programmatically, you can use the Python `openai` library.
+
+# See the `client.py` script in the examples repository
+# [here](https://github.com/modal-labs/modal-examples/tree/main/06_gpu_and_ml/llm-serving/openai_compatible)
+# to take it for a spin:
+
+# ```bash
+# # pip install openai==1.13.3
+# python openai_compatible/client.py
+# ```
+
+# We also include a basic example of a load-testing setup using
+# `locust` in the `load_test.py` script [here](https://github.com/modal-labs/modal-examples/tree/main/06_gpu_and_ml/llm-serving/openai_compatibl):
+
+# ```bash
+# modal run openai_compatible/load_test.py
+# ```
+
+# ## Addenda
+
+# The rest of the code in this example is utility code.
+
+
+def get_model_config(engine):
+    import asyncio
+
+    try:  # adapted from vLLM source -- https://github.com/vllm-project/vllm/blob/507ef787d85dec24490069ffceacbd6b161f4f72/vllm/entrypoints/openai/api_server.py#L235C1-L247C1
+        event_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        event_loop = None
+
+    if event_loop is not None and event_loop.is_running():
+        # If the current is instanced by Ray Serve,
+        # there is already a running event loop
+        model_config = event_loop.run_until_complete(engine.get_model_config())
+    else:
+        # When using single vLLM without engine_use_ray
+        model_config = asyncio.run(engine.get_model_config())
+
+    return model_config

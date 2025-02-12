@@ -1,14 +1,18 @@
+# # Show a progress bar with tqdm on Modal
+
+# This example shows how you can show a progress bar with [tqdm](https://github.com/tqdm/tqdm) on Modal.
+
 import time
 
 import modal
 
-stub = modal.Stub(
+app = modal.App(
     "example-tqdm",
     image=modal.Image.debian_slim().pip_install("tqdm"),
 )
 
 
-@stub.function()
+@app.function()
 def f():
     from tqdm import tqdm
 
@@ -17,5 +21,5 @@ def f():
 
 
 if __name__ == "__main__":
-    with stub.run():
+    with app.run():
         f.remote()

@@ -1,23 +1,22 @@
 # ---
 # lambda-test: false
 # ---
+
 # # MultiOn: Twitter News Agent
 
 # In this example, we use Modal to deploy a cron job that periodically checks for AI news everyday and tweets it on Twitter using the MultiOn Agent API.
 
-# ## Import and define the stub
-#
-# Let's start off with imports, and defining a Modal stub.
+# ## Import and define the app
+
+# Let's start off with imports, and defining a Modal app.
 
 import os
 
 import modal
 
-stub = modal.Stub("multion-news-tweet-agent")
+app = modal.App("multion-news-tweet-agent")
 
 # ## Searching for AI News
-#
-
 
 # Let's also define an image that has the `multion` package installed, so we can query the API.
 
@@ -29,14 +28,14 @@ multion_image = modal.Image.debian_slim().pip_install("multion")
 # ## Set up MultiOn
 #
 # [MultiOn](https://multion.ai/) is a next-gen Web Action Agent that can take actions on behalf of the user. You can watch it in action here: [Youtube demo](https://www.youtube.com/watch?v=Rm67ry6bogw).
-#
+
 # The MultiOn API enables building the next level of web automation & custom AI agents capable of performing complex actions on the internet with just a few lines of code.
-#
+
 # To get started, first create an account with [MultiOn](https://app.multion.ai/), install the [MultiOn chrome extension](https://chrome.google.com/webstore/detail/ddmjhdbknfidiopmbaceghhhbgbpenmm) and login to your Twitter account in your browser.
 # To use the API create a [MultiOn API Key](https://app.multion.ai/api-keys) and store it as a modal secret on [the dashboard](https://modal.com/secrets)
 
 
-@stub.function(
+@app.function(
     image=multion_image, secrets=[modal.Secret.from_name("MULTION_API_KEY")]
 )
 def news_tweet_agent():
@@ -61,15 +60,15 @@ def news_tweet_agent():
 
 
 # ## Test running
-#
-# We can now test run our scheduled function as follows: `modal run multion_news_agent.py.py::stub.news_tweet_agent`
+
+# We can now test run our scheduled function as follows: `modal run multion_news_agent.py.py::app.news_tweet_agent`
 
 # ## Defining the schedule and deploying
-#
+
 # Let's define a function that will be called by Modal every day.
 
 
-@stub.function(schedule=modal.Cron("0 9 * * *"))
+@app.function(schedule=modal.Cron("0 9 * * *"))
 def run_daily():
     news_tweet_agent.remote()
 

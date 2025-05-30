@@ -14,6 +14,8 @@
 # Let's start by importing the Modal client and defining the model that we want to serve.
 
 
+from typing import Optional
+
 import modal
 
 MODEL_DIR = "/model"
@@ -154,7 +156,7 @@ async def transcribe_hf_dataset(dataset_name):
     ds = load_dataset(dataset_name, "clean", split="validation")
     print("📂 Dataset loaded")
     batched_whisper = Model()
-    print("📣 Sending data for transcripton")
+    print("📣 Sending data for transcription")
     async for transcription in batched_whisper.transcribe.map.aio(ds["audio"]):
         yield transcription
 
@@ -166,7 +168,7 @@ async def transcribe_hf_dataset(dataset_name):
 
 
 @app.local_entrypoint()
-async def main(dataset_name: str = None):
+async def main(dataset_name: Optional[str] = None):
     if dataset_name is None:
         dataset_name = "hf-internal-testing/librispeech_asr_dummy"
     for result in transcribe_hf_dataset.remote_gen(dataset_name):

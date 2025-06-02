@@ -89,8 +89,8 @@ VLLM_PORT = 8000
 @app.function(
     image=vllm_image,
     gpu=f"H100:{N_GPU}",
-    # how long should we stay up with no requests?
-    scaledown_window=15 * MINUTES,
+    scaledown_window=15 * MINUTES,  # how long should we stay up with no requests?
+    timeout=10 * MINUTES,  # how long should we wait for container start?
     volumes={
         "/root/.cache/huggingface": hf_cache_vol,
         "/root/.cache/vllm": vllm_cache_vol,
@@ -151,7 +151,7 @@ def serve():
 # to take it for a spin:
 
 # ```bash
-# # pip install openai==1.13.3
+# # pip install openai==1.76.0
 # python openai_compatible/client.py
 # ```
 
@@ -175,16 +175,16 @@ def serve():
 
 
 @app.local_entrypoint()
-def test(test_timeout=5 * MINUTES):
+def test(test_timeout=10 * MINUTES):
     import json
     import time
     import urllib
 
-    print(f"Running health check for server at {serve.web_url}")
+    print(f"Running health check for server at {serve.get_web_url()}")
     up, start, delay = False, time.time(), 10
     while not up:
         try:
-            with urllib.request.urlopen(serve.web_url + "/health") as response:
+            with urllib.request.urlopen(serve.get_web_url() + "/health") as response:
                 if response.getcode() == 200:
                     up = True
         except Exception:
@@ -192,12 +192,12 @@ def test(test_timeout=5 * MINUTES):
                 break
             time.sleep(delay)
 
-    assert up, f"Failed health check for server at {serve.web_url}"
+    assert up, f"Failed health check for server at {serve.get_web_url()}"
 
-    print(f"Successful health check for server at {serve.web_url}")
+    print(f"Successful health check for server at {serve.get_web_url()}")
 
     messages = [{"role": "user", "content": "Testing! Is this thing on?"}]
-    print(f"Sending a sample message to {serve.web_url}", *messages, sep="\n")
+    print(f"Sending a sample message to {serve.get_web_url()}", *messages, sep="\n")
 
     headers = {
         "Authorization": f"Bearer {API_KEY}",
@@ -205,7 +205,7 @@ def test(test_timeout=5 * MINUTES):
     }
     payload = json.dumps({"messages": messages, "model": MODEL_NAME})
     req = urllib.request.Request(
-        serve.web_url + "/v1/chat/completions",
+        serve.get_web_url() + "/v1/chat/completions",
         data=payload.encode("utf-8"),
         headers=headers,
         method="POST",

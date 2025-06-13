@@ -23,6 +23,7 @@ import io
 import random
 import time
 from pathlib import Path
+from typing import Optional
 
 import modal
 
@@ -70,7 +71,7 @@ with image.imports():
 
 # ## Implementing SD3.5 Large Turbo inference on Modal
 
-# We wrap inference in a Modal [Cls](https://modal.com/docs/guide/lifecycle-methods)
+# We wrap inference in a Modal [Cls](https://modal.com/docs/guide/lifecycle-functions)
 # that ensures models are loaded and then moved to the GPU once when a new container
 # starts, before the container picks up any work.
 
@@ -104,7 +105,9 @@ class Inference:
         ).to("cuda")
 
     @modal.method()
-    def run(self, prompt: str, batch_size: int = 4, seed: int = None) -> list[bytes]:
+    def run(
+        self, prompt: str, batch_size: int = 4, seed: Optional[int] = None
+    ) -> list[bytes]:
         seed = seed if seed is not None else random.randint(0, 2**32 - 1)
         print("seeding RNG with", seed)
         torch.manual_seed(seed)
@@ -125,7 +128,7 @@ class Inference:
         return image_output
 
     @modal.fastapi_endpoint(docs=True)
-    def web(self, prompt: str, seed: int = None):
+    def web(self, prompt: str, seed: Optional[int] = None):
         return Response(
             content=self.run.local(  # run in the same container
                 prompt, batch_size=1, seed=seed
@@ -156,7 +159,7 @@ def entrypoint(
     samples: int = 4,
     prompt: str = "A princess riding on a pony",
     batch_size: int = 4,
-    seed: int = None,
+    seed: Optional[int] = None,
 ):
     print(
         f"prompt => {prompt}",
@@ -248,7 +251,7 @@ def ui():
             "index.html",
             {
                 "request": request,
-                "inference_url": Inference.web.web_url,
+                "inference_url": Inference.web.get_web_url(),
                 "model_name": "Stable Diffusion 3.5 Large Turbo",
                 "default_prompt": "A cinematic shot of a baby raccoon wearing an intricate italian priest robe.",
             },

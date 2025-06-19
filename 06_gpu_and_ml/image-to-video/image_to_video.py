@@ -25,7 +25,7 @@ import io
 import random
 import time
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Optional
 
 import fastapi
 import modal
@@ -101,7 +101,7 @@ output_volume = modal.Volume.from_name("outputs", create_if_missing=True)
 
 # ## Implementing LTX-Video inference on Modal
 
-# We wrap the inference logic in a Modal [Cls](https://modal.com/docs/guide/lifecycle-methods)
+# We wrap the inference logic in a Modal [Cls](https://modal.com/docs/guide/lifecycle-functions)
 # that ensures models are loaded and then moved to the GPU once when a new instance
 # starts, rather than every time we run it.
 
@@ -142,10 +142,10 @@ class Inference:
         self,
         image_bytes: bytes,
         prompt: str,
-        negative_prompt: str = None,
-        num_frames: int = None,
-        num_inference_steps: int = None,
-        seed: int = None,
+        negative_prompt: Optional[str] = None,
+        num_frames: Optional[int] = None,
+        num_inference_steps: Optional[int] = None,
+        seed: Optional[int] = None,
     ) -> str:
         negative_prompt = (
             negative_prompt
@@ -171,7 +171,9 @@ class Inference:
             num_inference_steps=num_inference_steps,
         ).frames[0]
 
-        mp4_name = slugify(prompt)
+        mp4_name = (
+            f"{seed}_{''.join(c if c.isalnum() else '-' for c in prompt[:100])}.mp4"
+        )
         diffusers.utils.export_to_video(
             video, f"{Path(OUTPUT_PATH) / mp4_name}", fps=24
         )
@@ -184,10 +186,10 @@ class Inference:
         self,
         image_bytes: Annotated[bytes, fastapi.File()],
         prompt: str,
-        negative_prompt: str = None,
-        num_frames: int = None,
-        num_inference_steps: int = None,
-        seed: int = None,
+        negative_prompt: Optional[str] = None,
+        num_frames: Optional[int] = None,
+        num_inference_steps: Optional[int] = None,
+        seed: Optional[int] = None,
     ) -> fastapi.Response:
         mp4_name = self.run.local(  # run in the same container
             image_bytes=image_bytes,
@@ -223,10 +225,10 @@ class Inference:
 def entrypoint(
     image_path: str,
     prompt: str,
-    negative_prompt: str = None,
-    num_frames: int = None,
-    num_inference_steps: int = None,
-    seed: int = None,
+    negative_prompt: Optional[str] = None,
+    num_frames: Optional[int] = None,
+    num_inference_steps: Optional[int] = None,
+    seed: Optional[int] = None,
     twice: bool = True,
 ):
     import os
@@ -320,7 +322,7 @@ def ui():
             "index.html",
             {
                 "request": request,
-                "inference_url": Inference().web.web_url,
+                "inference_url": Inference().web.get_web_url(),
                 "model_name": "LTX-Video Image to Video",
                 "default_prompt": "A young girl stands calmly in the foreground, looking directly at the camera, as a house fire rages in the background.",
             },
@@ -333,7 +335,3 @@ def ui():
     )
 
     return web_app
-
-
-def slugify(s: str) -> str:
-    return f"{time.strftime('%Y%m%d_%H%M%S')}_{''.join(c if c.isalnum() else '-' for c in s[:100]).strip('-')}.mp4"

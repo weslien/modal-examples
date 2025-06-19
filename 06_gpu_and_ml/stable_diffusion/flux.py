@@ -5,6 +5,9 @@
 
 # # Run Flux fast on H100s with `torch.compile`
 
+# _Update: To speed up inference by another >2x, check out the additional optimization
+# techniques we tried in [this blog post](https://modal.com/blog/flux-3x-faster)!_
+
 # In this guide, we'll run Flux as fast as possible on Modal using open source tools.
 # We'll use `torch.compile` and NVIDIA H100 GPUs.
 
@@ -249,7 +252,7 @@ def optimize(pipe, compile=True):
     )
 
     # trigger torch compilation
-    print("🔦 running torch compiliation (may take up to 20 minutes)...")
+    print("🔦 running torch compilation (may take up to 20 minutes)...")
 
     pipe(
         "dummy prompt to trigger torch compilation",

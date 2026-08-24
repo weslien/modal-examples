@@ -46,9 +46,8 @@ CONFIG = {
         "synonyms": [["cls", "class"]],
     },
     "stop_urls": [
-        "https://modal.com/docs/reference/modal.Stub",
         "https://modal.com/gpu-glossary",
-        "https://modal.com/docs/reference/changelog",
+        "https://modal.com/docs/sdk/py/changelog",
     ],
     "start_urls": [
         {
@@ -63,6 +62,21 @@ CONFIG = {
         },
         {
             "url": "https://modal.com/docs/sdk/py/latest",
+            "selectors_key": "reference",
+            "page_rank": 1,
+        },
+        {
+            "url": "https://modal.com/docs/sdk/js/latest",
+            "selectors_key": "reference",
+            "page_rank": 1,
+        },
+        {
+            "url": "https://modal.com/docs/sdk/go/latest",
+            "selectors_key": "reference",
+            "page_rank": 1,
+        },
+        {
+            "url": "https://modal.com/docs/cli/latest",
             "selectors_key": "reference",
             "page_rank": 1,
         },

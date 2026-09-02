@@ -1,3 +1,7 @@
+# ---
+# deploy: true
+# ---
+
 # # Orchestrate a multi-step pipeline with Modal Functions
 
 # Every step of this pipeline is a Modal Function that hands off to the next one,
@@ -8,23 +12,17 @@
 # The toy computation used here is to build a range of numbers, square them, and sum them. Each
 # step caches its output on a Volume, so a rerun skips work already done.
 
-# Run it and see its trace:
-
-# ```bash
-# modal run 09_job_queues/pipeline_orchestration.py --n 10
-# ```
-
 # Because the steps hand off by name against a pinned version, the App has to be
-# deployed before it runs. The entrypoint deploys it for you if it isn't already,
-# but you can also deploy explicitly:
+# deployed before it runs. Deploy it, then run it and see its trace:
 
 # ```bash
 # modal deploy 09_job_queues/pipeline_orchestration.py
+# modal run 09_job_queues/pipeline_orchestration.py --n 10
 # ```
 
-# Run that again with the same `n` and every step hits the cache. Deploy again and
-# every step recomputes regardless of which step you edited because keys are constructed partly by App version,
-# which a deploy bumps for the whole App.
+# Run the pipeline again with the same `n` and every step hits the cache. Deploy
+# again and the next run recomputes every step, whichever step you edited, because
+# keys are constructed partly by App version, which a deploy bumps for the whole App.
 
 # ## Set up
 
@@ -34,9 +32,8 @@ import json
 import subprocess
 import time
 import uuid
-from dataclasses import dataclass, field
 from pathlib import Path
-from typing import NamedTuple
+from typing import NamedTuple, TypedDict
 
 import modal
 
@@ -70,13 +67,12 @@ STEPS = [
 ]
 
 
-@dataclass
-class Pipeline:
+class Pipeline(TypedDict):
     run_id: str  # unique per execution
     app_version: int  # deployed code version this run is pinned to
     input_id: str  # identifies the input and names its directory on the Volume
-    function_call_ids: list[str] = field(default_factory=list)  # `fc-`, per step
-    done: bool = False
+    function_call_ids: list[str]  # `fc-`, per step
+    done: bool
 
 
 # ## Construct artifact keys
@@ -88,7 +84,7 @@ class Pipeline:
 
 
 def cache_key(pipeline: Pipeline, step_num: int) -> str:
-    key = f"{pipeline.input_id}@v{pipeline.app_version}"  # the version seeds the chain
+    key = f"{pipeline['input_id']}@v{pipeline['app_version']}"  # the version seeds the chain
     for step in STEPS[: step_num + 1]:
         digest = hashlib.sha256(f"{step.name}/{key}".encode()).hexdigest()
         key = f"{step.name}-{digest[:16]}"
@@ -101,14 +97,15 @@ def artifact(pipeline: Pipeline, step_num: int) -> Path:
 
 # ## Coordinate work handoff
 
-# Whoever spawns a step stamps its call id onto the run, so the trace builds up as the
+# Each step stamps its call id onto the run when it starts, so the trace builds up as the
 # pipeline moves and always ends with the step that is currently pending. Every
 # hand-off goes through the one pinned lookup in `step_function`.
 
 
 def start_step(pipeline: Pipeline, step_num: int) -> Path:
     data.reload()  # a container only sees the Volume as of when it started
-    pipeline.function_call_ids.append(modal.current_function_call_id())
+    pipeline["function_call_ids"].append(modal.current_function_call_id())
+    state[pipeline["run_id"]] = pipeline
 
     out = artifact(pipeline, step_num)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -121,18 +118,22 @@ def step_function(step_num: int, app_version: int) -> modal.Function:
     return modal.Function.from_name(APP_NAME, STEPS[step_num].name, version=app_version)
 
 
+def function_call_key(run_id: str, step_num: int) -> str:
+    return f"{run_id}/function-calls/{step_num}"
+
+
 def spawn_step(pipeline: Pipeline, step_num: int) -> modal.FunctionCall:
-    step = step_function(step_num, pipeline.app_version)
+    step = step_function(step_num, pipeline["app_version"])
+    state[pipeline["run_id"]] = pipeline
     call = step.spawn(pipeline, step_num)
-    pipeline.function_call_ids.append(call.object_id)
-    state[pipeline.run_id] = pipeline
+    state[function_call_key(pipeline["run_id"], step_num)] = call.object_id
     return call
 
 
 def spawn_next(pipeline: Pipeline, step_num: int) -> None:
     if step_num + 1 >= len(STEPS):
-        pipeline.done = True
-        state[pipeline.run_id] = pipeline
+        pipeline["done"] = True
+        state[pipeline["run_id"]] = pipeline
         print("[done]")
         return
 
@@ -152,7 +153,7 @@ def spawn_next(pipeline: Pipeline, step_num: int) -> None:
 def build(pipeline: Pipeline, step_num: int) -> None:
     out = start_step(pipeline, step_num)
     if not out.exists():
-        with open(DATA_DIR / pipeline.input_id / "input.json") as f:
+        with open(DATA_DIR / pipeline["input_id"] / "input.json") as f:
             n = json.load(f)["n"]
         np.save(out, np.arange(1, n + 1))
         data.commit()
@@ -184,39 +185,27 @@ def total(pipeline: Pipeline, step_num: int) -> None:
 
 # ## Trigger a run from a local driver
 
-# The driver reads the version that's live now, deploys if there isn't one, and pins
-# the run to it. Note, version pinning is a
+# The driver reads the latest deployed version and pins the run to it. Note, version
+# pinning is a
 # [Team and Enterprise feature](https://modal.com/docs/guide/trigger-deployed-functions#version-pinned-lookups).
 
 
-def latest_version() -> int | None:
+def deployed_version() -> int:
     history = subprocess.run(
         ["modal", "app", "history", APP_NAME, "--json"], capture_output=True, text=True
     )
     versions = json.loads(history.stdout) if history.returncode == 0 else []
     numbers = [str(v.get("version", "")).removeprefix("v") for v in versions]
-    return max((int(n) for n in numbers if n.isdigit()), default=None)
-
-
-def deployed_version() -> int | None:
-    version = latest_version()
-    if version is None:
-        return None
-    try:
-        step_function(0, version).hydrate()
-    except modal.exception.NotFoundError:
-        return None
-    return version
-
-
-def ensure_deployed() -> int:
-    version = deployed_version()
-    if version is None:
-        subprocess.run(["modal", "deploy", __file__], check=True)
-        version = deployed_version()
-    if version is None:
-        raise RuntimeError(f"no version to pin to: modal app history {APP_NAME}")
-    return version
+    version = max((int(n) for n in numbers if n.isdigit()), default=None)
+    if version is not None:
+        try:
+            step_function(0, version).hydrate()
+            return version
+        except modal.exception.NotFoundError:
+            pass
+    raise RuntimeError(
+        "deploy first: modal deploy 09_job_queues/pipeline_orchestration.py"
+    )
 
 
 def stage_input(n: int) -> str:
@@ -237,24 +226,32 @@ def trigger(n: int, app_version: int) -> str:
         run_id=f"run-{uuid.uuid4().hex[:8]}",
         app_version=app_version,
         input_id=stage_input(n),
+        function_call_ids=[],
+        done=False,
     )
     call = spawn_step(pipeline, 0)
-    print(f"Started {pipeline.run_id} on v{pipeline.app_version}: {call.object_id}")
-    return pipeline.run_id
+    print(
+        f"Started {pipeline['run_id']} on v{pipeline['app_version']}: {call.object_id}"
+    )
+    return pipeline["run_id"]
 
 
 def wait(run_id: str, timeout: int = 5 * MINUTES) -> Pipeline:
     deadline = time.time() + timeout
     while time.time() < deadline:
         pipeline = state.get(run_id)
-        if pipeline is not None and pipeline.function_call_ids:
-            if pipeline.done:
+        if pipeline is not None:
+            if pipeline["done"]:
                 return pipeline
-            call_id = pipeline.function_call_ids[-1]
-            try:
-                modal.FunctionCall.from_id(call_id).get(timeout=0)
-            except TimeoutError:
-                pass
+            call_ids = pipeline["function_call_ids"]
+            call_id = state.get(function_call_key(run_id, len(call_ids)))
+            if call_id is None and call_ids:
+                call_id = call_ids[-1]
+            if call_id is not None:
+                try:
+                    modal.FunctionCall.from_id(call_id).get(timeout=0)
+                except TimeoutError:
+                    pass
         time.sleep(1)
     raise TimeoutError(f"{run_id} did not finish in {timeout}s")
 
@@ -264,8 +261,8 @@ def wait(run_id: str, timeout: int = 5 * MINUTES) -> Pipeline:
 
 
 def report(pipeline: Pipeline) -> None:
-    print(f"\n{pipeline.run_id} finished on v{pipeline.app_version}:")
-    for step_num, call_id in enumerate(pipeline.function_call_ids):
+    print(f"\n{pipeline['run_id']} finished on v{pipeline['app_version']}:")
+    for step_num, call_id in enumerate(pipeline["function_call_ids"]):
         print(f"  {cache_key(pipeline, step_num)}  function_call={call_id}")
     final_key = cache_key(pipeline, len(STEPS) - 1)
     result = json.loads(b"".join(data.read_file(f"{final_key}/{STEPS[-1].output}")))
@@ -274,5 +271,4 @@ def report(pipeline: Pipeline) -> None:
 
 @app.local_entrypoint()
 def run(n: int = 10) -> None:
-    app_version = ensure_deployed()
-    report(wait(trigger(n, app_version)))
+    report(wait(trigger(n, deployed_version())))

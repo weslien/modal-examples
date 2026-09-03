@@ -11,7 +11,7 @@
 # outbound requests:
 
 # ```
-# Sandbox code  ->  proxy Sidecar  ->  api.anthropic.com
+# Sandbox code  ->  proxy Sidecar  ->  gated Web Function
 # (no API key)      (adds the key)
 # ```
 
@@ -21,27 +21,78 @@
 # else, while the key itself stays in a Modal
 # [Secret](https://modal.com/docs/guide/secrets) mounted on the Sidecar alone.
 
-# We use [Caddy](https://caddyserver.com/) as the proxy and the Anthropic API as the
-# upstream, but any proxy that can set request headers (nginx, Envoy, or something you
+# We use [Caddy](https://caddyserver.com/) as the proxy and a Modal
+# [Web Function](https://modal.com/docs/guide/webhooks) as the
+# service we are trying to access. Any proxy that can set request headers (nginx, Envoy, or something you
 # write yourself) and any authenticated API will do.
 
 # Sandbox Sidecars are in alpha and access is restricted to allowlisted workspaces.
 
-# To run this example, create the Secret it reads the key from:
-
-# ```
-# modal secret create anthropic-secret ANTHROPIC_API_KEY=sk-ant-...
-# ```
 
 import argparse
+import hmac
+import os
+import secrets
 import tempfile
 from pathlib import Path
+from urllib.parse import urlparse
 
+import fastapi
 import modal
 
 app = modal.App.lookup("example-sidecar-secrets-injection", create_if_missing=True)
 
 MINUTES = 60  # seconds
+
+# ## Gate an API behind a Secret
+
+# We start by creating a secret and storing it in a Modal
+# [Secret](https://modal.com/docs/guide/secrets)
+#
+
+modal.Secret.objects.create(
+    "example-sidecar-api-key",
+    {"API_KEY": secrets.token_urlsafe(32)},
+    allow_existing=True,
+)
+api_secret = modal.Secret.from_name(
+    "example-sidecar-api-key", required_keys=["API_KEY"]
+)
+
+# We create the Secret in this script, so there is nothing to set up
+# ahead of time, but this can also be done manually as
+#
+# ```
+# modal secret create example-api-secret API_KEY=...
+# ```
+
+# We then deploy a Web Function that requires authentication to mimic any
+# external gated service you may want to access.
+#
+# The Sandbox will never call this function directly; it will call it
+# throught the Sidecar as a proxy which in turn will call the function.
+
+web_app = modal.App("example-sidecar-secrets-injection-web")
+web_image = modal.Image.debian_slim().uv_pip_install("fastapi[standard]==0.139.2")
+
+
+@web_app.function(image=web_image, secrets=[api_secret], serialized=True)
+@modal.fastapi_endpoint()
+def greet(request: fastapi.Request):
+    expected = os.environ["API_KEY"]
+    if not hmac.compare_digest(request.headers.get("x-api-key", ""), expected):
+        raise fastapi.HTTPException(status_code=401, detail="unauthorized")
+    return {"message": "Hello from a secret-gated endpoint."}
+
+
+with modal.enable_output():
+    web_app.deploy()
+
+upstream_url = greet.get_web_url()
+if not upstream_url:
+    raise RuntimeError("Web Function did not publish a URL")
+upstream_host = urlparse(upstream_url).hostname
+print(f"Upstream URL: {upstream_url}")
 
 # ## Configure the proxy
 
@@ -54,7 +105,7 @@ PROXY_URL = f"http://{SIDECAR_NAME}:{SIDECAR_PORT}"
 
 # The proxy's behavior is defined by a
 # [Caddyfile](https://caddyserver.com/docs/caddyfile). Ours forwards every request to the
-# Anthropic API, filling in the real key from the Sidecar's own environment. It also
+# Web Function, filling in the real key from the Sidecar's own environment. It also
 # drops any `Authorization` header that came from the Sandbox, so the proxy decides which
 # key reaches the upstream.
 
@@ -64,13 +115,14 @@ DEFAULT_CADDYFILE = """\
 }
 
 :8080 {
-    reverse_proxy https://api.anthropic.com {
-        header_up Host api.anthropic.com
-        header_up x-api-key {env.ANTHROPIC_API_KEY}
+    reverse_proxy https://%s {
+        header_up Host %s
+        header_up x-api-key {env.API_KEY}
         header_up -Authorization
     }
 }
-"""
+""" % (upstream_host, upstream_host)
+
 
 # To point the proxy at a different upstream, or to add rules of your own — rate limits,
 # path restrictions, extra headers — pass your own config instead:
@@ -105,9 +157,7 @@ with tempfile.TemporaryDirectory() as tmp_dir:
             .build(app)
         )
 
-sandbox_image = modal.Image.debian_slim(python_version="3.12").pip_install(
-    "anthropic==0.121.0"
-)
+sandbox_image = modal.Image.debian_slim(python_version="3.12")
 
 # ## Start the Sandbox
 
@@ -121,7 +171,7 @@ with modal.enable_output():
     sandbox = modal.Sandbox.create(
         app=app,
         image=sandbox_image,
-        env={"ANTHROPIC_BASE_URL": PROXY_URL},
+        env={"API_BASE_URL": PROXY_URL},
         outbound_cidr_allowlist=[],
         timeout=5 * MINUTES,
     )
@@ -129,14 +179,12 @@ print(f"Sandbox ID: {sandbox.object_id}")
 
 # ## Start the proxy Sidecar
 
-# Now we start Caddy alongside it, with the Anthropic Secret mounted here and only here.
+# Now we start Caddy alongside it, with the API Secret mounted here and only here.
 
 sidecar = sandbox._experimental_sidecars.create(
     name=SIDECAR_NAME,
     image=sidecar_image,
-    secrets=[
-        modal.Secret.from_name("anthropic-secret", required_keys=["ANTHROPIC_API_KEY"])
-    ],
+    secrets=[api_secret],
 )
 print(f"Sidecar ID: {sidecar.object_id}")
 
@@ -152,36 +200,33 @@ sandbox.exec(
 
 # ## Call the API from the Sandbox
 
-# The code below runs inside the Sandbox. It first shows what it has to work with — no key,
-# and no direct route to Anthropic — then calls the API with an invalid key, which the
-# proxy swaps out for the real one on the way through.
+# The code below runs inside the Sandbox. It first tries to connect to the Web Function
+# directly, which is blocked by the allowlist, then calls through the proxy, which swaps
+# in the real key on the way through.
 
-# Note that the call itself is unmodified from what it would be without a proxy: the
-# Anthropic SDK, like most SDKs and agent harnesses, picks up its base URL from the
-# environment.
+# Note that the call itself is unmodified from what it would be without a proxy: it
+# picks up its base URL from the environment, the same way most SDKs and agent harnesses do.
 
-UNTRUSTED_CODE = """
+UNTRUSTED_CODE = f"""
+import json
 import os
 import socket
+import urllib.request
 
-import anthropic
-
-print(f"ANTHROPIC_API_KEY in Sandbox env: {'ANTHROPIC_API_KEY' in os.environ}")
+print(f"API_KEY in Sandbox env: {{'API_KEY' in os.environ}}")
 
 try:
-    socket.create_connection(("api.anthropic.com", 443), timeout=10).close()
-    print("Direct connection to api.anthropic.com: succeeded")
+    socket.create_connection(({upstream_host!r}, 443), timeout=10).close()
+    print("Direct connection to {upstream_host}: succeeded")
 except OSError as exc:
-    print(f"Direct connection to api.anthropic.com: blocked ({type(exc).__name__})")
+    print(f"Direct connection to {upstream_host}: blocked ({{type(exc).__name__}})")
 
-print(f"Calling Anthropic through {os.environ['ANTHROPIC_BASE_URL']} with an invalid key")
-client = anthropic.Anthropic(api_key="not-a-real-key")
-message = client.messages.create(
-    model="claude-haiku-4-5-20251001",
-    max_tokens=256,
-    messages=[{"role": "user", "content": "Say hello in one sentence."}],
-)
-print(f"Response: {message.content[0].text}")
+url = os.environ["API_BASE_URL"]
+print(f"Calling {{url}} with an invalid key")
+req = urllib.request.Request(url, headers={{"x-api-key": "not-a-real-key"}})
+with urllib.request.urlopen(req, timeout=60) as resp:
+    body = json.loads(resp.read())
+print(f"Response: {{body['message']}}")
 """
 
 process = sandbox.exec("python", "-c", UNTRUSTED_CODE)
@@ -193,10 +238,10 @@ if process.wait() != 0:
 # The output should look something like
 
 # ```
-# ANTHROPIC_API_KEY in Sandbox env: False
-# Direct connection to api.anthropic.com: blocked (OSError)
-# Calling Anthropic through http://egress-proxy:8080 with an invalid key
-# Response: Hello! It's nice to meet you.
+# API_KEY in Sandbox env: False
+# Direct connection to workspace--example-sidecar-secrets-injection-web-greet.modal.run: blocked (TimeoutError)
+# Calling http://egress-proxy:8080 with an invalid key
+# Response: Hello from a secret-gated endpoint.
 # ```
 
 # Terminating the Sandbox tears down its Sidecars along with it.
@@ -204,6 +249,6 @@ if process.wait() != 0:
 sandbox.terminate()
 
 # It's worth knowing where this boundary ends: the Sandbox never sees the key, but
-# it can still use it, and can make as many Anthropic calls as it likes. If that matters
+# it can still use it, and can make as many calls as it likes. If that matters
 # for your workload, the proxy is also the natural place to add rate limits or to restrict
 # which paths it forwards.
